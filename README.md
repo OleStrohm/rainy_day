@@ -18,4 +18,4 @@ and can be rolled back
 ## Specification
 
 This project is specified using [tracey](https://tracey.bearcove.eu/) and the
-specification is in [./docs/spec/rainy_day.md]
+specification is in [docs/spec/rainy_day.md](./docs/spec/rainy_day.md)
