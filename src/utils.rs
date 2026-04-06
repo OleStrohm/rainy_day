@@ -13,6 +13,7 @@ impl ReadWriteOnVfsPath for VfsPath {
     }
 
     fn write(&self, data: &[u8]) -> VfsResult<usize> {
+        self.parent().create_dir_all()?;
         Ok(self.create_file()?.write(data)?)
     }
 }

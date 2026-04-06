@@ -1,73 +1,144 @@
+use std::sync::mpsc;
+
 use eyre::Result;
-use rand::{Rng, RngExt, rngs::ThreadRng};
 use serde::{Deserialize, Serialize};
 use vfs::VfsPath;
 
-use crate::utils::ReadWriteOnVfsPath;
+use crate::{
+    shared::{MessageToClient, MessageToStore},
+    utils::ReadWriteOnVfsPath,
+};
 
 #[derive(Serialize, Deserialize)]
 pub struct FileMetadata {
     pub salt: String,
 }
 
+struct ClientConnection {
+    send: mpsc::Sender<MessageToClient>,
+    recv: mpsc::Receiver<MessageToStore>,
+}
+
+pub enum StoreControl {
+    Shutdown,
+    NewClient(
+        mpsc::Sender<MessageToClient>,
+        mpsc::Receiver<MessageToStore>,
+    ),
+}
+
 pub struct Store {
     root: VfsPath,
-    salt_rng: Box<dyn Rng>,
+    clients: Vec<ClientConnection>,
+    control: mpsc::Receiver<StoreControl>,
 }
 
 impl Store {
-    // r[depends store.init]
-    pub fn init(root: VfsPath) -> Result<Store> {
-        Self::with_salt_rng(root, ThreadRng::default())
-    }
-
-    // r[impl store.init]
-    pub fn with_salt_rng(root: VfsPath, salt_rng: impl Rng + 'static) -> Result<Store> {
-        root.remove_dir_all()?;
+    pub fn init(root: VfsPath) -> Result<(Store, mpsc::Sender<StoreControl>)> {
         root.create_dir_all()?;
-        root.join("rainy_day")?
-            .create_file()?
-            .write(b"Just in case")?;
+        if !root.join("rainy_day")?.exists()? {
+            root.join("rainy_day")?
+                .create_file()?
+                .write(b"Just in case")?;
+        }
 
-        Ok(Store {
+        let (sender, receiver) = mpsc::channel();
+
+        let store = Store {
             root,
-            salt_rng: Box::new(salt_rng) as _,
-        })
+            clients: vec![],
+            control: receiver,
+        };
+
+        Ok((store, sender))
     }
 
-    pub fn generate_salt(&mut self) -> [u8; 64] {
-        self.salt_rng.random()
+    pub fn run(mut self) {
+        loop {
+            if let Ok(msg) = self.control.try_recv() {
+                match msg {
+                    StoreControl::Shutdown => return,
+                    StoreControl::NewClient(sender, receiver) => {
+                        self.clients.push(ClientConnection {
+                            send: sender,
+                            recv: receiver,
+                        });
+                    }
+                }
+            }
+
+            for client in &self.clients {
+                if let Ok(msg) = client.recv.try_recv() {
+                    match msg {
+                        MessageToStore::Insert {
+                            encrypted_contents,
+                            hashed_file_path,
+                            encrypted_file_path,
+                        } => {
+                            self.insert_file(
+                                encrypted_contents,
+                                hashed_file_path.clone(),
+                                encrypted_file_path,
+                            )
+                            .unwrap();
+                            client
+                                .send
+                                .send(MessageToClient::Inserted { hashed_file_path })
+                                .unwrap();
+                        }
+                        MessageToStore::Retrieve { hashed_file_path } => {
+                            let (contents, metadata) =
+                                self.retrieve(hashed_file_path.clone()).unwrap();
+
+                            client
+                                .send
+                                .send(MessageToClient::Retrieved {
+                                    hashed_file_path,
+                                    contents,
+                                    metadata,
+                                })
+                                .unwrap();
+                        }
+                        MessageToStore::RetrieveAll => {
+                            let files = self
+                                .root
+                                .read_dir()
+                                .unwrap()
+                                .flat_map(|d| -> Result<_> {
+                                    Ok((d.filename(), d.join("path")?.read()?))
+                                })
+                                .collect::<Vec<_>>();
+
+                            client
+                                .send
+                                .send(MessageToClient::RetrievedAllFiles { files })
+                                .unwrap();
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // r[impl insert.file]
     pub fn insert_file(
         &self,
         contents: Vec<u8>,
-        salt: [u8; 64],
         hashed_file_path: impl AsRef<str>,
         // r[depends encryption.client]
         encrypted_file_path: Vec<u8>,
     ) -> Result<()> {
         let file_path = self.root.join(hashed_file_path)?;
-
-        println!("Creating {:?}", file_path);
         file_path.create_dir()?;
 
         let metadata = FileMetadata {
-            salt: hex::encode(salt),
+            salt: String::new(),
         };
-
-        let metadata_path = file_path.join("metadata.json")?;
-        println!("Creating {metadata_path:?}");
-        metadata_path.write(serde_json::to_string_pretty(&metadata)?.as_bytes())?;
-
-        let contents_path = file_path.join("contents")?;
-        println!("Creating {contents_path:?}");
-        contents_path.write(&contents)?;
-
-        let path_path = file_path.join("path")?;
-        println!("Creating {path_path:?}");
-        path_path.write(&encrypted_file_path)?;
+        file_path
+            .join("metadata.json")?
+            .write(serde_json::to_string_pretty(&metadata)?.as_bytes())?;
+        file_path.join("contents")?.write(&contents)?;
+        file_path.join("path")?.write(&encrypted_file_path)?;
 
         Ok(())
     }
@@ -76,14 +147,9 @@ impl Store {
     pub fn retrieve(&self, hashed_file_path: impl AsRef<str>) -> Result<(Vec<u8>, FileMetadata)> {
         let file_path = self.root.join(hashed_file_path)?;
 
-        let metadata_path = file_path.join("metadata.json")?;
-
-        println!("Reading from {metadata_path:?}");
-        let metadata = serde_json::from_slice::<FileMetadata>(&metadata_path.read()?)?;
-
-        let contents_path = file_path.join("contents")?;
-        println!("Reading from {contents_path:?}");
-        let encrypted_contents = contents_path.read()?;
+        let metadata =
+            serde_json::from_slice::<FileMetadata>(&file_path.join("metadata.json")?.read()?)?;
+        let encrypted_contents = file_path.join("contents")?.read()?;
 
         Ok((encrypted_contents, metadata))
     }
